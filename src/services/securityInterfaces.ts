@@ -37,6 +37,21 @@ export interface SpeakerVerificationService {
   ): Promise<SpeakerSegmentResult>;
 
   /**
+   * Compare a live speaker embedding against all enrolled contacts in directory
+   */
+  verifyAgainstAllEnrolled(
+    liveEmbedding: number[],
+    contacts: Array<{
+      id: string;
+      name: string;
+      relationship: string;
+      speakerProfile?: SpeakerProfile;
+    }>,
+    expectedContactNameOrId?: string,
+    segmentHistory?: SpeakerSegmentResult[]
+  ): Promise<SpeakerSegmentResult>;
+
+  /**
    * Calculate cosine similarity between two unit vectors
    */
   cosineSimilarity(vecA: number[], vecB: number[]): number;

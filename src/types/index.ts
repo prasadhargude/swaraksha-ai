@@ -44,6 +44,8 @@ export interface SignalMessage {
   text?: string;
   is_final?: boolean;
   speaker_user_id?: string;
+  sdp?: RTCSessionDescriptionInit | string;
+  candidate?: RTCIceCandidateInit;
   user?: { user_id: string; username: string; status?: string };
   user_id?: string;
   users?: Array<{ user_id: string; username: string; status: string }>;

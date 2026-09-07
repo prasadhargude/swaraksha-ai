@@ -1,5 +1,6 @@
 import { ApiConstants } from '../constants';
 import { DetectionState, DetectionVerdict } from '../types';
+import { LiveAudioStreamProcessor, AcousticAnalysisMetrics } from './realAudioEngine';
 
 export class DetectionWindowService {
   private windowSize = ApiConstants.baraConfig.windowSize;
@@ -76,6 +77,7 @@ export class DeepfakeDetectionEngine {
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private intervalId: number | null = null;
+  private liveProcessor: LiveAudioStreamProcessor | null = null;
 
   public subscribe(callback: (state: DetectionState) => void): () => void {
     this.subscribers.push(callback);
@@ -110,6 +112,10 @@ export class DeepfakeDetectionEngine {
   public stopMonitoring(): void {
     this.isMonitoring = false;
     this.windowService.reset();
+    if (this.liveProcessor) {
+      this.liveProcessor.stop();
+      this.liveProcessor = null;
+    }
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
@@ -157,62 +163,25 @@ export class DeepfakeDetectionEngine {
   }
 
   /**
-   * Evaluates audio buffer energy and computes BARA autoencoder reconstruction error
+   * Evaluates audio buffer energy and computes real-time BARA autoencoder reconstruction error
    */
   public evaluateAudioStream(mediaStream: MediaStream): void {
     try {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.audioContext = new AudioCtx();
-      const source = this.audioContext.createMediaStreamSource(mediaStream);
-      this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 512;
-      source.connect(this.analyser);
-
-      const bufferLength = this.analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      let silentFrames = 0;
-      let totalFrames = 0;
-
-      // Sample every 2 seconds (4s window with 50% overlap per BARA spec)
-      this.intervalId = window.setInterval(() => {
-        if (!this.isMonitoring || !this.analyser) return;
-
-        this.analyser.getByteFrequencyData(dataArray);
-        
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          sum += dataArray[i];
-        }
-        const avgEnergy = sum / bufferLength;
-        const normalizedEnergy = avgEnergy / 255;
-
-        totalFrames++;
-        if (normalizedEnergy < ApiConstants.baraConfig.vadEnergyThreshold) {
-          silentFrames++;
-        }
-
-        const silenceRatio = totalFrames > 0 ? silentFrames / totalFrames : 0;
-        const isReliable = silenceRatio <= ApiConstants.baraConfig.maxSilenceRatio && normalizedEnergy > 0.01;
-
-        // Reset frame counters for next 2-second tick
-        silentFrames = 0;
-        totalFrames = 0;
-
-        // Calculate reconstruction MSE:
-        // Genuine real speech gives lower reconstruction error (approx 21 - 32 MSE)
-        // High harmonic anomalies / synthetic patterns give higher error (> 32 MSE)
-        const spectralSpread = this.calculateSpectralCentroid(dataArray);
-        const naturalMse = 24.5 + (spectralSpread % 8.5);
-
+      if (this.liveProcessor) {
+        this.liveProcessor.stop();
+      }
+      this.isMonitoring = true;
+      this.liveProcessor = new LiveAudioStreamProcessor(mediaStream, (metrics) => {
+        if (!this.isMonitoring) return;
         this.processChunk({
-          mse: naturalMse,
-          isFake: naturalMse > this.threshold,
-          isReliable,
-          silenceRatio,
-          rmsEnergy: normalizedEnergy,
+          mse: metrics.reconstructionMse,
+          isFake: metrics.isFake,
+          isReliable: metrics.isReliable,
+          silenceRatio: metrics.silenceRatio,
+          rmsEnergy: metrics.rmsEnergy,
         });
-      }, 2000);
+      });
+      this.liveProcessor.start();
     } catch (e) {
       console.error('Failed to initialize audio stream analyzer:', e);
     }

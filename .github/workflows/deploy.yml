@@ -39,8 +39,9 @@ jobs:
 
       - name: Build project with environment variables
         env:
-          # If you define any environment variables in GitHub Secrets, map them here:
-          # VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_RENDER_HTTP_URL: ${{ secrets.VITE_RENDER_HTTP_URL }}
+          VITE_RENDER_WS_URL: ${{ secrets.VITE_RENDER_WS_URL }}
+          VITE_LIVEKIT_URL: ${{ secrets.VITE_LIVEKIT_URL }}
           NODE_ENV: production
         run: npm run build
 

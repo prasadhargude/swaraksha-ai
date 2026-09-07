@@ -16,11 +16,14 @@ import {
   MultiSignalRiskEngine,
 } from './securityInterfaces';
 import { SecurityCrypto } from './securityCrypto';
+import { RealAudioEngine } from './realAudioEngine';
 
-// 1. Speaker Embedding Provider (Simulates modern on-device ResNet34 / ECAPA-TDNN feature extraction)
+// 1. Speaker Embedding Provider (Extracts real acoustic features on Float32Array PCM or seeded fallback)
 export class NeuralSpeakerEmbeddingProvider implements SpeakerEmbeddingProvider {
   async extractEmbedding(audioData: Float32Array | Blob | string): Promise<number[]> {
-    // In real ML integration, this invokes on-device ONNX Runtime / TFLite speaker model
+    if (audioData instanceof Float32Array) {
+      return RealAudioEngine.extractAcousticEmbedding(audioData);
+    }
     const seed = typeof audioData === 'string' ? audioData : 'audio_chunk_' + Date.now();
     return SecurityCrypto.generateEmbedding(seed, 0.04);
   }
@@ -116,6 +119,142 @@ export class ContinuousSpeakerVerificationService implements SpeakerVerification
       speakerChanged,
       activeSpeakerLabel,
       embeddingSnapshot: liveEmbedding,
+    };
+  }
+
+  async verifyAgainstAllEnrolled(
+    liveEmbedding: number[],
+    contacts: Array<{
+      id: string;
+      name: string;
+      relationship: string;
+      speakerProfile?: SpeakerProfile;
+    }>,
+    expectedContactNameOrId?: string,
+    segmentHistory: SpeakerSegmentResult[] = []
+  ): Promise<SpeakerSegmentResult> {
+    const enrolled = contacts.filter(
+      (c) => c.speakerProfile && c.speakerProfile.embedding && c.speakerProfile.embedding.length > 0
+    );
+
+    if (enrolled.length === 0) {
+      return {
+        segmentId: 'seg_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
+        timestamp: Date.now(),
+        similarityScore: 0.5,
+        status: 'inconclusive',
+        statusLabel: 'No enrolled voice fingerprints in directory',
+        speakerChanged: false,
+        activeSpeakerLabel: 'Unenrolled Speaker',
+        embeddingSnapshot: liveEmbedding,
+        allEnrolledMatches: [],
+      };
+    }
+
+    // Evaluate live embedding against EVERY enrolled contact fingerprint
+    const matchScores = enrolled.map((c) => {
+      const rawSim = SecurityCrypto.cosineSimilarity(
+        c.speakerProfile!.embedding,
+        liveEmbedding
+      );
+      return {
+        contactId: c.id,
+        contactName: c.name,
+        relationship: c.relationship,
+        similarity: Math.min(0.99, Math.max(0.05, rawSim)),
+        isMatch: rawSim >= 0.74,
+      };
+    });
+
+    // Sort by similarity descending
+    matchScores.sort((a, b) => b.similarity - a.similarity);
+    const best = matchScores[0];
+
+    // Check if an expected contact was targeted
+    const expected = expectedContactNameOrId
+      ? matchScores.find(
+          (m) =>
+            m.contactId === expectedContactNameOrId ||
+            m.contactName.toLowerCase() === expectedContactNameOrId.toLowerCase() ||
+            expectedContactNameOrId.toLowerCase().includes(m.contactName.toLowerCase())
+        )
+      : null;
+
+    let status: SpeakerVerificationStatus = 'inconclusive';
+    let statusLabel = '';
+    let activeSpeakerLabel = 'Unknown';
+    let displaySimilarity = best.similarity;
+    let hasSimilarity = false;
+
+    const matchThreshold = 0.74;
+    const possibleMismatchThreshold = 0.56;
+
+    if (best.similarity >= matchThreshold) {
+      // High acoustic similarity with an enrolled fingerprint!
+      hasSimilarity = true;
+      if (expected && expected.contactId === best.contactId) {
+        status = 'match';
+        statusLabel = `Voice verified: Matches enrolled fingerprint for ${best.contactName}${best.relationship ? ` (${best.relationship})` : ''}`;
+        activeSpeakerLabel = best.contactName;
+        displaySimilarity = best.similarity;
+      } else if (expected && expected.contactId !== best.contactId) {
+        status = 'possibleMismatch';
+        statusLabel = `Speaker mismatch: Voice matches ${best.contactName}, not ${expected.contactName}!`;
+        activeSpeakerLabel = `${best.contactName} (Unexpected)`;
+        displaySimilarity = expected.similarity;
+      } else {
+        status = 'match';
+        statusLabel = `Voice verified: Matches enrolled fingerprint for ${best.contactName}${best.relationship ? ` (${best.relationship})` : ''}`;
+        activeSpeakerLabel = best.contactName;
+        displaySimilarity = best.similarity;
+      }
+    } else if (best.similarity >= possibleMismatchThreshold) {
+      status = 'possibleMismatch';
+      hasSimilarity = false;
+      if (expected) {
+        statusLabel = `Acoustic variance: Voice diverges from enrolled profile for ${expected.contactName}`;
+        activeSpeakerLabel = `Uncertain (${expected.contactName}?)`;
+        displaySimilarity = expected.similarity;
+      } else {
+        statusLabel = `Acoustic variance: Voice does not reliably match any enrolled fingerprint`;
+        activeSpeakerLabel = 'Uncertain Voice';
+        displaySimilarity = best.similarity;
+      }
+    } else {
+      status = 'unknown';
+      hasSimilarity = false;
+      statusLabel = expected
+        ? `No voice similarity: Caller does not match enrolled profile for ${expected.contactName}`
+        : 'No voice similarity: Caller does not match any enrolled fingerprint';
+      activeSpeakerLabel = 'Unknown Voice';
+      displaySimilarity = expected ? expected.similarity : best.similarity;
+    }
+
+    // Check if sudden speaker change occurred
+    let speakerChanged = false;
+    if (segmentHistory.length > 0) {
+      const last = segmentHistory[segmentHistory.length - 1];
+      if (last.status === 'match' && status !== 'match') {
+        speakerChanged = true;
+      } else if (last.matchedContactId && last.matchedContactId !== best.contactId && best.similarity >= matchThreshold) {
+        speakerChanged = true;
+      }
+    }
+
+    return {
+      segmentId: 'seg_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
+      timestamp: Date.now(),
+      similarityScore: displaySimilarity,
+      hasSimilarity,
+      status,
+      statusLabel,
+      speakerChanged,
+      activeSpeakerLabel,
+      embeddingSnapshot: liveEmbedding,
+      matchedContactName: best.similarity >= matchThreshold ? best.contactName : undefined,
+      matchedContactId: best.similarity >= matchThreshold ? best.contactId : undefined,
+      matchedRelationship: best.similarity >= matchThreshold ? best.relationship : undefined,
+      allEnrolledMatches: matchScores,
     };
   }
 

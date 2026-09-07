@@ -146,6 +146,14 @@ class SoundEffectManager {
     }
   }
 
+  public playRingtone(): void {
+    this.startIncomingRingtone();
+  }
+
+  public stopRingtone(): void {
+    this.stopIncomingRingtone();
+  }
+
   /**
    * Call connected chime (two rising cheerful beeps)
    */

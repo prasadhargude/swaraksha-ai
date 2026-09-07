@@ -34,15 +34,28 @@ export type SpeakerVerificationStatus =
   | 'unknown'
   | 'inconclusive';
 
+export interface EnrolledMatchCandidate {
+  contactId: string;
+  contactName: string;
+  relationship: string;
+  similarity: number; // 0.0 - 1.0
+  isMatch: boolean;
+}
+
 export interface SpeakerSegmentResult {
   segmentId: string;
   timestamp: number;
   similarityScore: number; // 0.0 - 1.0
+  hasSimilarity?: boolean;
   status: SpeakerVerificationStatus;
   statusLabel: string;
   speakerChanged: boolean;
   activeSpeakerLabel: string; // "Amit", "Unknown Speaker 2", etc.
   embeddingSnapshot: number[];
+  matchedContactName?: string;
+  matchedContactId?: string;
+  matchedRelationship?: string;
+  allEnrolledMatches?: EnrolledMatchCandidate[];
 }
 
 export interface VoiceAuthenticityResult {

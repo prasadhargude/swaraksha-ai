@@ -16,9 +16,9 @@ export const AppColors = {
 } as const;
 
 export const ApiConstants = {
-  renderHttpUrl: 'https://swaraksha-app-36el.onrender.com',
-  renderWsUrl: 'wss://swaraksha-app-36el.onrender.com',
-  livekitServerUrl: 'wss://mybot-02r08nwi.livekit.cloud',
+  renderHttpUrl: (import.meta.env.VITE_RENDER_HTTP_URL as string) || 'https://swaraksha-app-36el.onrender.com',
+  renderWsUrl: (import.meta.env.VITE_RENDER_WS_URL as string) || 'wss://swaraksha-app-36el.onrender.com',
+  livekitServerUrl: (import.meta.env.VITE_LIVEKIT_URL as string) || 'wss://mybot-02r08nwi.livekit.cloud',
   
   registerUserPath: '/api/users/register',
   livekitTokenPath: '/api/livekit/token',

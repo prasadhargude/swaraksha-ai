@@ -22,6 +22,7 @@ import { Loader2 } from 'lucide-react';
 import {
   TrustedContact,
   DemoScenarioId,
+  DemoScenario,
   ActiveVerificationState,
   SpeakerSegmentResult,
 } from './types/speakerFingerprint';
@@ -34,6 +35,10 @@ import {
   activeVerificationEvaluator,
   multiSignalRiskEngine,
 } from './services/speakerVerificationEngine';
+import { webrtcCallService } from './services/webrtcCallService';
+import { liveSpeechToText } from './services/liveSpeechToText';
+import { RealAudioEngine } from './services/realAudioEngine';
+import { callerSpeechService } from './services/callerSpeechService';
 
 const DEFAULT_SETTINGS: BaraSettings = {
   threshold: ApiConstants.baraConfig.threshold,
@@ -87,6 +92,7 @@ export function App() {
     useState<ActiveVerificationState | null>(null);
 
   const scenarioStepTimersRef = useRef<number[]>([]);
+  const activeScenarioRef = useRef<DemoScenario | null>(null);
 
   // Deepfake detection state
   const [detectionState, setDetectionState] = useState<DetectionState>(deepfakeService.getState());
@@ -98,6 +104,123 @@ export function App() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const callStartTimeRef = useRef<number | null>(null);
   const simIntervalRef = useRef<number | null>(null);
+  const pendingOfferSdpRef = useRef<RTCSessionDescriptionInit | string | null>(null);
+  const speakerVerificationTimerRef = useRef<number | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+
+  // Set up WebRTC callbacks to route remote audio to deepfake evaluator & speaker verification
+  useEffect(() => {
+    webrtcCallService.setCallbacks({
+      onRemoteStream: (remoteStream) => {
+        remoteStreamRef.current = remoteStream;
+        deepfakeService.evaluateAudioStream(remoteStream);
+      },
+      onError: (err) => {
+        console.warn('WebRTC peer error:', err);
+      },
+    });
+  }, []);
+
+  // Continuous real-time Voice Fingerprint verification loop (checks against all enrolled contacts)
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'connected') {
+      if (speakerVerificationTimerRef.current) {
+        clearInterval(speakerVerificationTimerRef.current);
+        speakerVerificationTimerRef.current = null;
+      }
+      return;
+    }
+
+    const audioCtx = RealAudioEngine.getAudioContext();
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    const timeDomainBuffer = new Float32Array(analyser.fftSize);
+
+    // Prefer incoming remote stream from caller, fall back to local stream if testing on single device
+    const activeStream =
+      remoteStreamRef.current ||
+      webrtcCallService.getRemoteStream() ||
+      callerSpeechService.getAudioStream() ||
+      localStreamRef.current;
+
+    let sourceNode: MediaStreamAudioSourceNode | null = null;
+    if (activeStream) {
+      try {
+        sourceNode = audioCtx.createMediaStreamSource(activeStream);
+        sourceNode.connect(analyser);
+      } catch (err) {
+        console.warn('Speaker verification audio stream routing notice:', err);
+      }
+    }
+
+    const segmentHistory: SpeakerSegmentResult[] = [];
+
+    speakerVerificationTimerRef.current = window.setInterval(async () => {
+      analyser.getFloatTimeDomainData(timeDomainBuffer);
+
+      let sumSq = 0;
+      for (let i = 0; i < timeDomainBuffer.length; i++) {
+        sumSq += timeDomainBuffer[i] * timeDomainBuffer[i];
+      }
+      const rms = Math.sqrt(sumSq / timeDomainBuffer.length);
+
+      // Only evaluate when vocal energy is detected
+      if (rms < 0.008) return;
+
+      const liveEmbedding = RealAudioEngine.extractAcousticEmbedding(
+        timeDomainBuffer,
+        audioCtx.sampleRate
+      );
+
+      // Verify against ALL enrolled contacts in directory!
+      const result = await continuousSpeakerVerification.verifyAgainstAllEnrolled(
+        liveEmbedding,
+        trustedContacts,
+        activeCall.peerUsername,
+        segmentHistory
+      );
+
+      segmentHistory.push(result);
+      if (segmentHistory.length > 10) segmentHistory.shift();
+
+      // Find verification questions for matched or expected contact
+      const relevantContact = trustedContacts.find(
+        (c) =>
+          (result.matchedContactId && c.id === result.matchedContactId) ||
+          c.name.toLowerCase() === activeCall.peerUsername.toLowerCase() ||
+          activeCall.peerUsername.toLowerCase().includes(c.name.toLowerCase())
+      );
+
+      setActiveVerificationState((prev) => ({
+        isTriggered:
+          prev?.isTriggered ||
+          result.status === 'unknown' ||
+          result.status === 'possibleMismatch',
+        triggerReason:
+          result.status !== 'match' ? result.statusLabel : prev?.triggerReason || '',
+        question:
+          prev?.question ||
+          (relevantContact && relevantContact.verificationQuestions.length > 0
+            ? relevantContact.verificationQuestions[0]
+            : undefined),
+        receiverAsked: prev?.receiverAsked || false,
+        evaluationResult: prev?.evaluationResult,
+        currentSegment: result,
+      }));
+    }, 1800);
+
+    return () => {
+      if (speakerVerificationTimerRef.current) {
+        clearInterval(speakerVerificationTimerRef.current);
+        speakerVerificationTimerRef.current = null;
+      }
+      if (sourceNode) {
+        try {
+          sourceNode.disconnect();
+        } catch (_) {}
+      }
+    };
+  }, [activeCall?.state, activeCall?.peerUserId, activeCall?.peerUsername, trustedContacts]);
 
   // Save history on change
   useEffect(() => {
@@ -218,6 +341,8 @@ export function App() {
             return;
           }
 
+          pendingOfferSdpRef.current = msg.sdp || null;
+
           setActiveCall({
             callId: msg.call_id || 'call-' + Date.now(),
             peerUserId: msg.from_user_id || 'unknown',
@@ -234,10 +359,55 @@ export function App() {
             clearTimeout(ringTimerRef.current);
             ringTimerRef.current = null;
           }
+
+          if (msg.sdp) {
+            webrtcCallService
+              .handleReceivedAnswer(msg.sdp as RTCSessionDescriptionInit)
+              .catch(console.warn);
+          }
+
           if (activeCallRef.current) {
             callStartTimeRef.current = Date.now();
             setActiveCall((prev) => (prev ? { ...prev, state: 'connected' } : null));
             deepfakeService.startMonitoring();
+
+            if (localStreamRef.current) {
+              deepfakeService.evaluateAudioStream(localStreamRef.current);
+            }
+
+            // Start live STT captioning on caller microphone to stream to receiver
+            liveSpeechToText.start((text, isFinal) => {
+              webrtcCallService.sendSignal({
+                type: 'live_transcript',
+                call_id: activeCallRef.current?.callId,
+                text,
+                is_final: isFinal,
+                from_user_id: currentUser?.userId,
+                to_user_id: activeCallRef.current?.peerUserId,
+              });
+
+              // If testing on a single device where peer is a simulated/test user, local mic is the caller speech
+              const isTest =
+                activeCallRef.current?.peerUsername.toLowerCase().includes('tester') ||
+                activeCallRef.current?.peerUserId.startsWith('tester');
+              if (isTest) {
+                const seg: TranscriptSegment = { text, isFinal, receivedAt: new Date() };
+                setTranscriptSegments((prev) => {
+                  if (prev.length > 0 && !prev[prev.length - 1].isFinal) {
+                    return [...prev.slice(0, -1), seg];
+                  }
+                  return [...prev.slice(-19), seg];
+                });
+              }
+            });
+          }
+          break;
+        }
+
+        case 'ice_candidate': {
+          if (msg.to_user_id !== currentUser.userId) return;
+          if (msg.candidate) {
+            webrtcCallService.handleIceCandidate(msg.candidate).catch(console.warn);
           }
           break;
         }
@@ -255,13 +425,26 @@ export function App() {
         }
 
         case 'live_transcript': {
+          if (
+            msg.to_user_id &&
+            msg.to_user_id !== currentUser?.userId &&
+            msg.to_user_id !== 'broadcast'
+          ) {
+            return;
+          }
           if (msg.text && msg.text.trim()) {
             const newSegment: TranscriptSegment = {
               text: msg.text.trim(),
               isFinal: msg.is_final ?? false,
               receivedAt: new Date(),
             };
-            setTranscriptSegments((prev) => [...prev.slice(-19), newSegment]);
+            setTranscriptSegments((prev) => {
+              // Replace preceding interim segment if updating in-flight speech
+              if (prev.length > 0 && !prev[prev.length - 1].isFinal) {
+                return [...prev.slice(0, -1), newSegment];
+              }
+              return [...prev.slice(-19), newSegment];
+            });
           }
           break;
         }
@@ -286,14 +469,9 @@ export function App() {
     }
 
     try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          localStreamRef.current = stream;
-        } catch (_) {
-          console.warn('Microphone permission not granted, proceeding with VoIP audio shell');
-        }
-      }
+      // Acquire real microphone stream for bi-directional WebRTC
+      const stream = await webrtcCallService.getMicrophoneStream();
+      localStreamRef.current = stream;
 
       const callId = 'call-' + Math.random().toString(36).substring(2, 9);
       callStartTimeRef.current = Date.now();
@@ -306,12 +484,16 @@ export function App() {
       });
       setTranscriptSegments([]);
 
-      webSocketService.send({
+      // Create WebRTC Offer with local microphone audio
+      const offer = await webrtcCallService.createCallOffer(callId, targetUser.userId, stream);
+
+      webrtcCallService.sendSignal({
         type: 'call_offer',
         call_id: callId,
         from_user_id: currentUser?.userId,
         from_username: currentUser?.username,
         to_user_id: targetUser.userId,
+        sdp: offer,
       });
 
       // 30s timeout matching Flutter _ringTimeout
@@ -323,29 +505,81 @@ export function App() {
         }
       }, 30000);
 
-      // Auto-connect standalone/demo call after 2 seconds
-      setTimeout(() => {
-        if (
-          activeCallRef.current?.callId === callId &&
-          activeCallRef.current?.state === 'ringingOutgoing'
-        ) {
-          callStartTimeRef.current = Date.now();
-          setActiveCall((prev) => (prev ? { ...prev, state: 'connected' } : null));
-          deepfakeService.startMonitoring();
+      // Auto-connect standalone/demo call after 2 seconds for offline or tester contacts
+      const isTesterPeer =
+        targetUser.username.toLowerCase().includes('tester') ||
+        targetUser.username.toLowerCase().includes('ai') ||
+        targetUser.userId.includes('alex') ||
+        targetUser.status === 'offline';
 
-          // Auto inject natural human speech sample
-          deepfakeService.injectSampleChunk('real');
-          setTranscriptSegments([
-            {
-              text: `Hello ${currentUser?.username}, this is ${targetUser.username}. Secure VoIP channel established.`,
-              isFinal: false,
-              receivedAt: new Date(),
-            },
-          ]);
-        }
-      }, 2200);
+      if (isTesterPeer) {
+        setTimeout(() => {
+          if (
+            activeCallRef.current?.callId === callId &&
+            activeCallRef.current?.state === 'ringingOutgoing'
+          ) {
+            callStartTimeRef.current = Date.now();
+            setActiveCall((prev) => (prev ? { ...prev, state: 'connected' } : null));
+            soundEffects.stopAll();
+            deepfakeService.startMonitoring();
+            deepfakeService.evaluateAudioStream(stream);
+
+            // Check if this contact has an enrolled voice fingerprint
+            const enrolled = trustedContacts.find(
+              (c) =>
+                c.name.toLowerCase() === targetUser.username.toLowerCase() ||
+                targetUser.username.toLowerCase().includes(c.name.toLowerCase())
+            );
+
+            // Contact actually speaks aloud through device speakers!
+            const greeting = enrolled
+              ? `Hey! I see your call. Glad you reached out. My voice fingerprint should be verified on your screen.`
+              : `Hello! I see your call. My audio stream is connected.`;
+
+            callerSpeechService.speakCallerText(greeting, {
+              pitch: 0.95,
+              rate: 1.0,
+              onStart: () => {
+                setTranscriptSegments([
+                  {
+                    text: `${targetUser.username}: "${greeting}"`,
+                    isFinal: true,
+                    receivedAt: new Date(),
+                  },
+                ]);
+              },
+            });
+
+            const hasSim = !!enrolled;
+            const segment: SpeakerSegmentResult = {
+              segmentId: 'seg-start-' + Date.now(),
+              timestamp: Date.now(),
+              similarityScore: hasSim ? 0.94 : 0.2,
+              hasSimilarity: hasSim,
+              status: hasSim ? 'match' : 'unknown',
+              statusLabel: hasSim
+                ? `Voice verified: Matches enrolled fingerprint for ${enrolled.name}${enrolled.relationship ? ` (${enrolled.relationship})` : ''}`
+                : 'No voice similarity: Caller does not match any enrolled fingerprint',
+              speakerChanged: false,
+              activeSpeakerLabel: targetUser.username,
+              embeddingSnapshot: [],
+              matchedContactName: hasSim ? enrolled.name : undefined,
+              matchedRelationship: hasSim ? enrolled.relationship : undefined,
+            };
+
+            setActiveVerificationState({
+              isTriggered: false,
+              triggerReason: '',
+              question: enrolled?.verificationQuestions[0],
+              receiverAsked: false,
+              currentSegment: segment,
+            });
+          }
+        }, 1800);
+      }
     } catch (err) {
-      showToast('Could not start call. Check microphone permission.');
+      console.error('Call initiation error:', err);
+      showToast('Could not access microphone. Please grant mic permission.');
     }
   };
 
@@ -353,53 +587,62 @@ export function App() {
   const handleAcceptCall = async () => {
     if (!activeCall) return;
 
+    soundEffects.stopRingtone();
     callStartTimeRef.current = Date.now();
 
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        localStreamRef.current = stream;
-        deepfakeService.evaluateAudioStream(stream);
-      } catch (_) {
-        console.warn('Mic access skipped or simulated');
-      }
+    const audioCtx = RealAudioEngine.getAudioContext();
+    if (audioCtx.state === 'suspended') {
+      await audioCtx.resume().catch(() => {});
     }
 
-    webSocketService.send({
-      type: 'call_answer',
-      call_id: activeCall.callId,
-      from_user_id: currentUser?.userId,
-      to_user_id: activeCall.peerUserId,
-    });
+    // If an incoming scenario was simulated, begin caller spoken conversation
+    if (activeScenarioRef.current) {
+      setActiveCall((prev) => (prev ? { ...prev, state: 'connected' } : null));
+      deepfakeService.startMonitoring();
+      startScenarioExecution(activeScenarioRef.current);
+      return;
+    }
 
-    setActiveCall((prev) => (prev ? { ...prev, state: 'connected' } : null));
-    deepfakeService.startMonitoring();
+    try {
+      const stream = await webrtcCallService.getMicrophoneStream();
+      localStreamRef.current = stream;
 
-    // If simulated deepfake test caller, automatically feed synthetic chunks after 1s
-    if (
-      activeCall.peerUsername.toLowerCase().includes('spoof') ||
-      activeCall.peerUsername.toLowerCase().includes('fake')
-    ) {
-      let count = 0;
-      simIntervalRef.current = window.setInterval(() => {
-        count++;
-        deepfakeService.injectSampleChunk('fake');
-        if (count >= 8 && simIntervalRef.current) {
-          clearInterval(simIntervalRef.current);
-          simIntervalRef.current = null;
-        }
-      }, 1200);
-    } else {
-      // Natural human caller
-      let count = 0;
-      simIntervalRef.current = window.setInterval(() => {
-        count++;
-        deepfakeService.injectSampleChunk('real');
-        if (count >= 6 && simIntervalRef.current) {
-          clearInterval(simIntervalRef.current);
-          simIntervalRef.current = null;
-        }
-      }, 1500);
+      let answerSdp: RTCSessionDescriptionInit | null = null;
+      if (pendingOfferSdpRef.current) {
+        answerSdp = await webrtcCallService.handleReceivedOffer(
+          activeCall.callId,
+          activeCall.peerUserId,
+          pendingOfferSdpRef.current as RTCSessionDescriptionInit,
+          stream
+        );
+      }
+
+      webrtcCallService.sendSignal({
+        type: 'call_answer',
+        call_id: activeCall.callId,
+        from_user_id: currentUser?.userId,
+        to_user_id: activeCall.peerUserId,
+        sdp: answerSdp,
+      });
+
+      setActiveCall((prev) => (prev ? { ...prev, state: 'connected' } : null));
+      deepfakeService.startMonitoring();
+      deepfakeService.evaluateAudioStream(stream);
+
+      // Start live STT captioning on callee microphone to send across to caller
+      liveSpeechToText.start((text, isFinal) => {
+        webrtcCallService.sendSignal({
+          type: 'live_transcript',
+          call_id: activeCall.callId,
+          text,
+          is_final: isFinal,
+          from_user_id: currentUser?.userId,
+          to_user_id: activeCall.peerUserId,
+        });
+      });
+    } catch (err) {
+      console.error('Accept call error:', err);
+      showToast('Microphone error during call answer.');
     }
   };
 
@@ -407,7 +650,7 @@ export function App() {
   const handleRejectCall = () => {
     if (!activeCall) return;
 
-    webSocketService.send({
+    webrtcCallService.sendSignal({
       type: 'call_reject',
       call_id: activeCall.callId,
       from_user_id: currentUser?.userId,
@@ -420,7 +663,7 @@ export function App() {
   // End active call locally and notify peer
   const handleEndCall = () => {
     if (activeCall) {
-      webSocketService.send({
+      webrtcCallService.sendSignal({
         type: 'call_end',
         call_id: activeCall.callId,
         from_user_id: currentUser?.userId,
@@ -439,6 +682,16 @@ export function App() {
       clearInterval(simIntervalRef.current);
       simIntervalRef.current = null;
     }
+    if (speakerVerificationTimerRef.current) {
+      clearInterval(speakerVerificationTimerRef.current);
+      speakerVerificationTimerRef.current = null;
+    }
+
+    liveSpeechToText.stop();
+    webrtcCallService.closePeerConnection();
+    deepfakeService.stopMonitoring();
+    pendingOfferSdpRef.current = null;
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
@@ -473,11 +726,12 @@ export function App() {
       setCallHistory((prev) => [historyItem, ...prev.slice(0, 49)]);
     }
 
-    // Clear any scenario simulation timers
+    // Clear any scenario simulation timers & speech synthesis
+    callerSpeechService.stop();
+    activeScenarioRef.current = null;
     scenarioStepTimersRef.current.forEach((t) => window.clearTimeout(t));
     scenarioStepTimersRef.current = [];
 
-    deepfakeService.stopMonitoring();
     setActiveCall(null);
     setTranscriptSegments([]);
     setActiveVerificationState(null);
@@ -487,6 +741,7 @@ export function App() {
 
   // Toggle Mute
   const handleToggleMute = (muted: boolean) => {
+    webrtcCallService.setMute(muted);
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((track) => {
         track.enabled = !muted;
@@ -559,17 +814,186 @@ export function App() {
     setTrustedContacts(TrustedContactsStore.getContacts());
   }, []);
 
-  // Simulate a Demo Scenario
+  // Progressive execution of scenario conversation once call is accepted and connected
+  const startScenarioExecution = (scenario: DemoScenario) => {
+    scenarioStepTimersRef.current.forEach((t) => window.clearTimeout(t));
+    scenarioStepTimersRef.current = [];
+
+    const contact =
+      trustedContacts.find(
+        (c) => c.name.toLowerCase() === scenario.contactName.toLowerCase()
+      ) ||
+      TrustedContactsStore.getContacts().find(
+        (c) => c.name.toLowerCase() === scenario.contactName.toLowerCase()
+      );
+
+    let accumulatedDelay = 600;
+
+    scenario.transcriptSteps.forEach((step, idx) => {
+      const timer = window.setTimeout(() => {
+        if (!activeCallRef.current || activeCallRef.current.state !== 'connected') {
+          return;
+        }
+
+        // Persona vocal characteristics
+        let pitch = 1.0;
+        let rate = 1.0;
+        if (step.speaker.toLowerCase().includes('cloned') || step.syntheticScore >= 0.8) {
+          pitch = 0.84;
+          rate = 0.94;
+        } else if (step.speaker.toLowerCase().includes('unknown')) {
+          pitch = 1.22;
+          rate = 1.05;
+        } else if (scenario.relationship.toLowerCase().includes('brother')) {
+          pitch = 0.95;
+          rate = 1.0;
+        }
+
+        // Caller speaks the dialogue aloud through the device audio pipeline!
+        if (step.text) {
+          callerSpeechService.speakCallerText(step.text, {
+            pitch,
+            rate,
+            onStart: () => {
+              // Incoming voice STT generates transcript segment
+              setTranscriptSegments((prev) => [
+                ...prev,
+                {
+                  text: `${step.speaker}: "${step.text}"`,
+                  isFinal: true,
+                  receivedAt: new Date(),
+                },
+              ]);
+            },
+          });
+        }
+
+        // Speaker verification: detect if there is similarity with ANY enrolled fingerprint
+        const isMatch = step.status === 'match';
+        const isMismatch = step.status === 'possibleMismatch';
+
+        let statusLabel = '';
+        if (isMatch) {
+          statusLabel = `Voice similarity verified: Matches enrolled fingerprint for ${scenario.contactName}${
+            scenario.relationship ? ` (${scenario.relationship})` : ''
+          }`;
+        } else if (isMismatch) {
+          statusLabel = `Voice divergence: Caller voice does not match enrolled profile for ${scenario.contactName}`;
+        } else {
+          statusLabel = `No voice similarity: Caller does not match any enrolled fingerprint`;
+        }
+
+        const segment: SpeakerSegmentResult = {
+          segmentId: `seg-${idx}-${Date.now()}`,
+          timestamp: Date.now(),
+          similarityScore: step.similarity,
+          hasSimilarity: isMatch,
+          status: step.status,
+          statusLabel,
+          speakerChanged: step.speakerChanged || false,
+          activeSpeakerLabel: step.speaker,
+          embeddingSnapshot: [],
+          matchedContactName: isMatch ? scenario.contactName : undefined,
+          matchedRelationship: isMatch ? scenario.relationship : undefined,
+        };
+
+        // BARA neural acoustic classifier
+        if (step.syntheticScore >= 0.7) {
+          setDetectionState((prev) => ({
+            ...prev,
+            verdict: 'fake',
+            anomalyScore: step.syntheticScore,
+            lastMse: 0.082,
+            realConfidence: 1 - step.syntheticScore,
+          }));
+        } else {
+          setDetectionState((prev) => ({
+            ...prev,
+            verdict: 'real',
+            anomalyScore: step.syntheticScore,
+            lastMse: 0.008,
+            realConfidence: 1 - step.syntheticScore,
+          }));
+        }
+
+        // Active verification state
+        setActiveVerificationState((prev) => {
+          const isTriggered = prev?.isTriggered || step.triggerVerification || false;
+          const question =
+            prev?.question ||
+            (contact && contact.verificationQuestions.length > 0
+              ? contact.verificationQuestions[0]
+              : undefined);
+
+          let evalRes: 'CORRECT' | 'INCORRECT' | 'UNCERTAIN' | 'PENDING' | undefined =
+            prev?.evaluationResult;
+
+          if (step.simulatedCallerResponse) {
+            evalRes = step.simulatedCallerAnswerCorrect ? 'CORRECT' : 'INCORRECT';
+
+            // Caller actually speaks answer response aloud
+            window.setTimeout(() => {
+              if (
+                activeCallRef.current?.state === 'connected' &&
+                step.simulatedCallerResponse
+              ) {
+                callerSpeechService.speakCallerText(step.simulatedCallerResponse, {
+                  pitch,
+                  rate,
+                  onStart: () => {
+                    setTranscriptSegments((p) => [
+                      ...p,
+                      {
+                        text: `${step.speaker}: "${step.simulatedCallerResponse}"`,
+                        isFinal: true,
+                        receivedAt: new Date(),
+                      },
+                    ]);
+                  },
+                });
+              }
+            }, 1200);
+          } else if (step.triggerVerification && !evalRes) {
+            evalRes = 'PENDING';
+          }
+
+          return {
+            isTriggered,
+            triggerReason: step.triggerVerification
+              ? `High financial urgency & conversation risk detected (${step.domain || 'Financial'})`
+              : prev?.triggerReason || '',
+            question,
+            receiverAsked: prev?.receiverAsked || step.triggerVerification || false,
+            callerResponseText: step.simulatedCallerResponse || prev?.callerResponseText,
+            evaluationResult: evalRes,
+            currentSegment: segment,
+          };
+        });
+
+        if (step.triggerVerification) {
+          soundEffects.playSpoofAlert();
+        }
+      }, accumulatedDelay);
+
+      scenarioStepTimersRef.current.push(timer);
+      const estimatedSpeechDuration = Math.max(2800, (step.text?.length || 30) * 65);
+      accumulatedDelay += step.delayMs + estimatedSpeechDuration;
+    });
+  };
+
+  // Simulate a Scenario incoming call
   const handleSimulateScenario = useCallback(
     (scenarioId: DemoScenarioId) => {
-      // Clear existing
+      // Clear any prior speech or timers
+      callerSpeechService.stop();
       scenarioStepTimersRef.current.forEach((t) => window.clearTimeout(t));
       scenarioStepTimersRef.current = [];
 
       const scenario = DEMO_SCENARIOS[scenarioId];
       if (!scenario) return;
 
-      // Find or create trusted contact for this scenario
+      activeScenarioRef.current = scenario;
+
       const contact =
         trustedContacts.find(
           (c) => c.name.toLowerCase() === scenario.contactName.toLowerCase()
@@ -581,7 +1005,7 @@ export function App() {
 
       const testCallId = 'scen-' + Date.now();
 
-      // Start call
+      // Ring incoming call
       setActiveCall({
         callId: testCallId,
         peerUserId: contact ? contact.id : 'contact_amit',
@@ -589,129 +1013,20 @@ export function App() {
         state: 'ringingIncoming',
       });
 
-      // Initial transcript
-      const initialStep = scenario.transcriptSteps[0];
+      // Play real ringtone sound
+      soundEffects.playRingtone();
+
+      // Initial pending banner
       setTranscriptSegments([
         {
-          text: initialStep?.text || 'Incoming call...',
+          text: `Incoming call from ${scenario.contactName} (${scenario.relationship})...`,
           isFinal: false,
           receivedAt: new Date(),
         },
       ]);
 
-      // Set initial verification state
-      setActiveVerificationState({
-        isTriggered: initialStep?.triggerVerification || false,
-        triggerReason: initialStep?.triggerVerification ? 'Risk threshold exceeded' : '',
-        question:
-          initialStep?.triggerVerification && contact?.verificationQuestions.length > 0
-            ? contact.verificationQuestions[0]
-            : undefined,
-        receiverAsked: false,
-        evaluationResult: initialStep?.triggerVerification ? 'PENDING' : undefined,
-        currentSegment: {
-          segmentId: 'seg-init',
-          timestamp: Date.now(),
-          similarityScore: initialStep?.similarity ?? 0.94,
-          status: initialStep?.status ?? 'match',
-          statusLabel: initialStep?.status === 'match' ? 'Match: Amit' : 'Analyzing',
-          speakerChanged: false,
-          activeSpeakerLabel: initialStep?.speaker || scenario.contactName,
-          embeddingSnapshot: [],
-        },
-      });
-
-      // Automatically schedule progressive steps once call progresses
-      let accumulatedDelay = 0;
-      scenario.transcriptSteps.forEach((step, idx) => {
-        accumulatedDelay += step.delayMs;
-        const timer = window.setTimeout(() => {
-          // Update transcript
-          if (step.text) {
-            setTranscriptSegments((prev) => [
-              ...prev,
-              {
-                text: `${step.speaker}: "${step.text}"`,
-                isFinal: true,
-                receivedAt: new Date(),
-              },
-            ]);
-          }
-
-          // Update speaker verification segment
-          const segment: SpeakerSegmentResult = {
-            segmentId: `seg-${idx}-${Date.now()}`,
-            timestamp: Date.now(),
-            similarityScore: step.similarity,
-            status: step.status,
-            statusLabel:
-              step.status === 'match'
-                ? `Match: ${scenario.contactName} (${Math.round(step.similarity * 100)}%)`
-                : step.status === 'possibleMismatch'
-                ? `Mismatch Alert (${Math.round(step.similarity * 100)}%)`
-                : `Unknown Speaker (${Math.round(step.similarity * 100)}%)`,
-            speakerChanged: step.speakerChanged || false,
-            activeSpeakerLabel: step.speaker,
-            embeddingSnapshot: [],
-          };
-
-          // Update detectionState synthetic verdict
-          if (step.syntheticScore >= 0.7) {
-            setDetectionState((prev) => ({
-              ...prev,
-              verdict: 'fake',
-              anomalyScore: step.syntheticScore,
-              lastMse: 0.082,
-              realConfidence: 1 - step.syntheticScore,
-            }));
-          } else {
-            setDetectionState((prev) => ({
-              ...prev,
-              verdict: 'real',
-              anomalyScore: step.syntheticScore,
-              lastMse: 0.008,
-              realConfidence: 1 - step.syntheticScore,
-            }));
-          }
-
-          // Update active verification state
-          setActiveVerificationState((prev) => {
-            const isTriggered = prev?.isTriggered || step.triggerVerification || false;
-            const question =
-              prev?.question ||
-              (contact && contact.verificationQuestions.length > 0
-                ? contact.verificationQuestions[0]
-                : undefined);
-
-            let evalRes: 'CORRECT' | 'INCORRECT' | 'UNCERTAIN' | 'PENDING' | undefined =
-              prev?.evaluationResult;
-
-            if (step.simulatedCallerResponse) {
-              evalRes = step.simulatedCallerAnswerCorrect ? 'CORRECT' : 'INCORRECT';
-            } else if (step.triggerVerification && !evalRes) {
-              evalRes = 'PENDING';
-            }
-
-            return {
-              isTriggered,
-              triggerReason: step.triggerVerification
-                ? `High financial urgency & conversation risk detected (${step.domain || 'Financial'})`
-                : prev?.triggerReason || '',
-              question,
-              receiverAsked: prev?.receiverAsked || step.triggerVerification || false,
-              callerResponseText: step.simulatedCallerResponse || prev?.callerResponseText,
-              evaluationResult: evalRes,
-              currentSegment: segment,
-            };
-          });
-
-          if (step.triggerVerification) {
-            soundEffects.playSpoofAlert();
-          }
-        }, accumulatedDelay);
-
-        scenarioStepTimersRef.current.push(timer);
-      });
+      // Reset verification state until call is answered
+      setActiveVerificationState(null);
     },
     [trustedContacts]
   );

@@ -303,9 +303,13 @@ export const ActiveCallScreen: React.FC<ActiveCallScreenProps> = ({
           </div>
         )}
 
-        {/* Live Transcript Subtitles */}
-        <div className="w-full max-w-xs my-1 max-h-16 overflow-hidden shrink-0">
-          <TranscriptOverlay segments={transcriptSegments} />
+        {/* Live Incoming Caller Transcript Subtitles */}
+        <div className="w-full max-w-sm px-2 my-1 shrink-0">
+          <TranscriptOverlay
+            segments={transcriptSegments}
+            callerName={trustedContact?.name || call.peerUsername}
+            isListening={isConnected && !isOnHold}
+          />
         </div>
       </div>
 

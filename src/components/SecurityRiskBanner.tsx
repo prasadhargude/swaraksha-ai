@@ -1,22 +1,15 @@
 import React from 'react';
 import {
   SpeakerSegmentResult,
-  VoiceAuthenticityResult,
-  ConversationRiskAnalysis,
   ComprehensiveRiskAssessment,
   ActiveVerificationState,
 } from '../types/speakerFingerprint';
 import {
   ShieldAlert,
-  ShieldCheck,
   UserCheck,
   UserX,
-  AlertTriangle,
-  HelpCircle,
-  Activity,
-  Layers,
-  FileText,
   KeyRound,
+  Fingerprint,
 } from 'lucide-react';
 
 interface SecurityRiskBannerProps {
@@ -38,63 +31,88 @@ export const SecurityRiskBanner: React.FC<SecurityRiskBannerProps> = ({
     riskAssessment.overallRiskLevel === 'HIGH' || riskAssessment.overallRiskLevel === 'CRITICAL';
   const isSuspicious = riskAssessment.overallRiskLevel === 'SUSPICIOUS';
 
+  const hasVoiceMatch =
+    speakerSegment?.hasSimilarity === true || speakerSegment?.status === 'match';
+  const isMismatch = speakerSegment?.status === 'possibleMismatch';
+  const isNoMatch = speakerSegment?.status === 'unknown';
+
   return (
     <div className="w-full flex flex-col gap-2 text-left">
-      {/* 1. Continuous Speaker Verification Card */}
+      {/* 1. Voice Fingerprint Similarity Verification Card (Only tells if there is similarity) */}
       <div
-        className={`w-full p-2.5 rounded-2xl border transition-all duration-300 flex items-center justify-between ${
-          speakerSegment?.status === 'match'
-            ? 'bg-[#18231C]/90 border-[#23A55A]/40 text-[#23A55A]'
-            : speakerSegment?.status === 'possibleMismatch'
-            ? 'bg-[#2A2315]/90 border-[#FEE75C]/40 text-[#FEE75C]'
-            : speakerSegment?.status === 'unknown'
-            ? 'bg-[#2B1B1D]/90 border-[#ED4245]/40 text-[#ED4245]'
-            : 'bg-[#181A1D]/90 border-[#2B2D31] text-[#949BA4]'
+        className={`w-full p-3 rounded-2xl border transition-all duration-300 flex items-center justify-between ${
+          hasVoiceMatch
+            ? 'bg-[#18231C]/95 border-[#23A55A]/50 text-[#23A55A]'
+            : isMismatch
+            ? 'bg-[#2A2315]/95 border-[#FEE75C]/50 text-[#FEE75C]'
+            : isNoMatch
+            ? 'bg-[#2B1B1D]/95 border-[#ED4245]/50 text-[#ED4245]'
+            : 'bg-[#181A1D]/95 border-[#2B2D31] text-[#949BA4]'
         }`}
       >
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-3 flex-1 min-w-0">
           <div
-            className={`p-1.5 rounded-xl ${
-              speakerSegment?.status === 'match'
-                ? 'bg-[#23A55A]/20'
-                : speakerSegment?.status === 'possibleMismatch'
-                ? 'bg-[#FEE75C]/20'
-                : 'bg-[#ED4245]/20'
+            className={`p-2 rounded-xl shrink-0 ${
+              hasVoiceMatch
+                ? 'bg-[#23A55A]/20 text-[#23A55A]'
+                : isMismatch
+                ? 'bg-[#FEE75C]/20 text-[#FEE75C]'
+                : isNoMatch
+                ? 'bg-[#ED4245]/20 text-[#ED4245]'
+                : 'bg-[#5865F2]/20 text-[#5865F2]'
             }`}
           >
-            {speakerSegment?.status === 'match' ? (
-              <UserCheck className="w-4 h-4" />
+            {hasVoiceMatch ? (
+              <UserCheck className="w-5 h-5" />
+            ) : isMismatch || isNoMatch ? (
+              <UserX className="w-5 h-5" />
             ) : (
-              <UserX className="w-4 h-4" />
+              <Fingerprint className="w-5 h-5 animate-pulse" />
             )}
           </div>
 
-          <div className="flex flex-col">
-            <div className="flex items-center gap-1.5">
+          <div className="flex flex-col min-w-0 pr-2">
+            <div className="flex items-center gap-2">
               <span className="text-[10px] uppercase font-extrabold tracking-wider opacity-80">
-                Speaker Identity
+                Voice Fingerprint Verification
               </span>
               {speakerSegment?.speakerChanged && (
-                <span className="px-1.5 py-0.2 bg-[#ED4245] text-white font-extrabold text-[9px] rounded-full animate-bounce">
-                  SPEAKER CHANGE
+                <span className="px-1.5 py-0.5 bg-[#ED4245] text-white font-extrabold text-[9px] rounded-full animate-bounce">
+                  SPEAKER CHANGE DETECTED
                 </span>
               )}
             </div>
-            <span className="text-xs font-bold text-white leading-tight mt-0.5">
-              {speakerSegment ? speakerSegment.statusLabel : 'Analyzing speaker voice profile...'}
+
+            <span className="text-xs font-bold text-white leading-snug mt-0.5">
+              {speakerSegment ? (
+                speakerSegment.statusLabel
+              ) : (
+                'Analyzing caller voice against enrolled fingerprints...'
+              )}
             </span>
           </div>
         </div>
 
-        {/* Confidence Percentage Badge */}
-        {speakerSegment && (
-          <div className="flex flex-col items-end">
-            <span className="text-[10px] text-[#949BA4] font-medium">Match</span>
-            <span className="text-xs font-mono font-bold text-white">
-              {Math.round(speakerSegment.similarityScore * 100)}%
+        {/* Clear Binary Similarity Tag */}
+        <div className="shrink-0 ml-2">
+          {hasVoiceMatch ? (
+            <span className="px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase bg-[#23A55A]/20 border border-[#23A55A]/60 text-[#23A55A]">
+              Similarity Detected
             </span>
-          </div>
-        )}
+          ) : isMismatch ? (
+            <span className="px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase bg-[#FEE75C]/20 border border-[#FEE75C]/60 text-[#FEE75C]">
+              Voice Divergence
+            </span>
+          ) : isNoMatch ? (
+            <span className="px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase bg-[#ED4245]/20 border border-[#ED4245]/60 text-[#ED4245]">
+              No Similarity
+            </span>
+          ) : (
+            <span className="px-2.5 py-1 rounded-full text-[10px] font-semibold bg-[#2B2D31] text-[#949BA4]">
+              Analyzing
+            </span>
+          )}
+        </div>
       </div>
 
       {/* 2. Conversation & Multi-Signal Risk Card */}
