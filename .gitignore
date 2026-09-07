@@ -1,0 +1,17 @@
+﻿.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+**/build/
+android/.gradle/
+android/app/build/
+android/build/
+.idea/
+.vscode/
+*.apk
+*.aab
+*.log
+.aider*
+.env
+.env

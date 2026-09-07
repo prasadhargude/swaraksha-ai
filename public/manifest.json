@@ -1,0 +1,19 @@
+{
+  "name": "Swaraksha - AI Voice Guard",
+  "short_name": "Swaraksha",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#121316",
+  "theme_color": "#121316",
+  "description": "On-device AI voice deepfake and spoof detection VoIP calling application with real-time audio analysis and presence.",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["communication", "security", "utilities"]
+}

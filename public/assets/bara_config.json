@@ -1,0 +1,8 @@
+{
+  "sample_rate": 16000,
+  "channels": 64,
+  "win_time": 0.025,
+  "hop_time": 0.010,
+  "max_frames": 400,
+  "threshold": 0.0021
+}

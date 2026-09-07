@@ -17,20 +17,6 @@ The original version of this app used a deployed backend to do this detection. T
 - Architecture: **"BARA"** — a Gammatone-filterbank feature extractor feeding a **Convolutional Autoencoder (CAE)** built in PyTorch (`bara_denoising_cae.pt`).
 - **Not a classifier.** It's trained only on real human voices. It tries to reconstruct its input; if the reconstruction error is high, that means "this doesn't look like real speech" → flagged as FAKE.
 - A threshold (97th percentile of reconstruction error on known-real audio, from `real_errors.npy`) decides the FAKE/REAL cutoff per chunk.
-
-### What "MSE" means here
-MSE = **Mean Squared Error**, the specific number used as "reconstruction error" throughout this project. For a given 4-second chunk:
-1. The model tries to rebuild the chunk's gammatone features from its compressed internal representation.
-2. Every value in the original is compared against the model's rebuilt version, and the difference (error) at each point is squared.
-3. All those squared differences are averaged into one number — the MSE.
-
-Because the model was trained only on real voices, it reconstructs real speech patterns well (**low MSE**). It never learned what synthetic/AI-generated voice patterns look like, so it reconstructs those poorly (**high MSE**). MSE is therefore used as a proxy signal: high MSE ≈ "this doesn't look like a pattern the model recognizes as real speech" ≈ likely fake.
-
-**Threshold values found in validation (see Known Issues, Section 6.1) — measured on the on-device TFLite model, not the original PyTorch scale:**
-- Real audio chunks: MSE range ~21 – 35 (mean ~26, p97 ~32)
-- Fake audio chunks: MSE range ~27 – 56 (mean ~36)
-- The two ranges **overlap** in the 27–35 zone — no single chunk-level threshold is perfect, which is exactly why the 10-chunk/20%-ratio rolling-window rule exists (a handful of noisy chunks shouldn't flip the verdict on their own).
-- Current production threshold: **32.0** (real p97), set in `DeepfakeModelService._threshold`.
 - Audio is processed in **4-second chunks with 50% overlap** (so a new chunk's result arrives roughly every 2 seconds).
 - **New decision rule** (added during this project): instead of trusting a single chunk, keep the last **10 chunk results**; if more than **20%** of them are FAKE, the rolling verdict is FAKE.
 
@@ -96,7 +82,7 @@ Located at: `android/app/src/main/java/com/cloudwebrtc/webrtc/bara/`
 ### New files
 - `lib/services/deepfake/bara_feature_extractor.dart` — Dart-side wrapper around the native channels above.
 - `lib/services/deepfake/deepfake_model_service.dart` — loads the `.tflite` model, runs inference per chunk, compares reconstruction error against the threshold.
-- `lib/services/deepfake/detection_window_service.dart` — rolling 10-chunk window; returns `real`/`fake`/`unknown` based on reliable-chunk ratio and consecutive-window hysteresis (see Section 8).
+- `lib/services/deepfake/detection_window_service.dart` — implements the rolling 10-chunk / 20%-fake-ratio rule.
 - `lib/providers/detection_provider.dart` — Riverpod provider exposing a live `bool` (suspicious or not) to the UI; loads the model once, listens to the chunk stream.
 - `lib/screens/home/widgets/spoof_overlay_widget.dart` — the red warning banner widget.
 
@@ -124,7 +110,7 @@ Registered in `pubspec.yaml` under `flutter: assets:`.
 
 ## 6. Known issues / unfinished work (as of this writing)
 
-1. **RESOLVED — TFLite model output scale vs. PyTorch.** The TFLite model's MSE values run ~15–25x higher than the original PyTorch model's on the same input. Investigated with `validate_tflite_model.py` across real (70 chunks) and fake (32 chunks) audio: the scale shift is **consistent and proportional**, not corruption — both models cleanly separate real from fake, just on different numeric scales. This is normal, expected quantization behavior. The threshold was recalibrated for the TFLite scale (32.0, from real p97) instead of reusing the original Python threshold (~0.002), which was ~800x too small for the converted model and had been causing 100% false positives. See the new "What MSE means here" subsection above for the measured ranges.
+1. **TFLite model output doesn't match PyTorch's output on the same real audio input** (see Section 2). This is the most important open item — until resolved, the model's FAKE/REAL judgments on-device can't be trusted to match what it was actually trained to do. Next diagnostic step in progress: comparing a float32-only (no quantization at all) TFLite conversion against PyTorch, to isolate whether the bug is in quantization or in the ONNX/TF graph conversion itself.
 
 2. **`GammatoneExtractor`'s FFT-based approach is an approximation of the original Python `gtgram()`,** not a verified exact match. Needs a side-by-side comparison of one real chunk's output from both pipelines.
 
@@ -142,42 +128,9 @@ Registered in `pubspec.yaml` under `flutter: assets:`.
 
 ---
 
-## 8. Robustness fixes — false positives from network degradation and noisy audio
-
-After the pipeline was running end-to-end, two related problems showed up: MSE spiking to 100+ during poor network conditions, and occasional false FAKE verdicts on genuinely real audio even under normal conditions. Root cause for both: the model was trained only on clean, isolated real speech, so **anything outside that training distribution — packet-loss artifacts, comfort noise, background noise, echo — produces high reconstruction error the same way a synthetic voice would.** High MSE means "unfamiliar to the model," not specifically "fake."
-
-Three layers were added to address this, without retraining the model:
-
-### 8.1 Voice Activity Detection (VAD) gating — native side
-`GammatoneExtractor.java` now computes RMS energy per 25ms frame (`VAD_ENERGY_THRESHOLD = 0.008`) and marks each frame voiced/unvoiced. `BaraAudioTap.java` tracks what fraction of a 4-second chunk was non-voiced (`silenceRatio`) and flags the whole chunk `isReliable = false` if that fraction exceeds `MAX_SILENCE_RATIO = 0.5`. This filters out chunks that are mostly silence, comfort noise, or PLC (packet loss concealment) filler before they ever reach the model.
-
-### 8.2 Network quality gating — Dart side
-`LiveKitService` now listens to LiveKit's `ParticipantConnectionQualityUpdatedEvent` for the **remote** participant (the person being analyzed, not the local user) and exposes it as `onRemoteNetworkQuality`. `DetectionNotifier` marks a chunk unreliable if network quality drops below "good," independent of what the VAD says — this catches degradation that doesn't necessarily show up as silence (e.g. garbled-but-loud audio).
-
-### 8.3 Minimum reliable votes + verdict states
-`DetectionWindowService` no longer always returns REAL or FAKE. It now returns one of three states: `real`, `fake`, or `unknown`. Unreliable chunks (from 8.1/8.2) are recorded as skipped, not as a vote. A verdict is only produced once at least `minReliableVotes = 5` (out of the last 10 chunks) are actually reliable — otherwise the state is `unknown`, and the UI shows nothing rather than guessing during bad network.
-
-### 8.4 Ratio threshold and hysteresis — reducing false positives on real audio
-Validation data (Section 2) showed real and fake MSE distributions overlap in the 27–35 range, so occasional individual real chunks legitimately cross the 32.0 threshold — this is expected, not a bug. Two changes reduce this from flipping the overall verdict:
-- `fakeRatioThreshold` raised from 0.20 to **0.30** — requires a larger share of the rolling window to read FAKE before triggering, giving more tolerance to isolated borderline chunks.
-- **Consecutive-window hysteresis** added to `DetectionWindowService`: a FAKE verdict now requires the fake-ratio condition to hold across **2 consecutive rolling windows** (`requiredConsecutiveFakeWindows = 2`, roughly ~4 seconds of sustained suspicion) before the UI shows the warning, instead of triggering on a single momentary crossing.
-
-### 8.5 Debug instrumentation
-`DetectionNotifier` logs `MSE`, `silenceRatio`, `isReliable`, and current `networkQuality` per chunk (`dev.log(..., name: 'DetectionDebug')`), to make it possible to inspect *why* a given false positive happened (network drop vs. background noise vs. genuine threshold overlap) instead of tuning blind.
-
-### Known remaining limitation
-None of the above teaches the model to actually recognize degraded/noisy real audio as real — it only prevents that audio from being scored at all. Background noise, music, laughing/coughing, speakerphone echo, and reverb can all still trigger occasional false positives during clean-network calls, since they're acoustically unfamiliar to a model trained on isolated clean speech. The structural fix (not yet done) is retraining/fine-tuning with augmented real audio — noisy, echoey, packet-loss-simulated — added to the "real" training class.
-
-### Tuning status
-`VAD_ENERGY_THRESHOLD`, `MAX_SILENCE_RATIO`, `minReliableVotes`, `fakeRatioThreshold`, and `requiredConsecutiveFakeWindows` are all reasonable starting values, not numbers measured against real call data. They should be tuned by logging real chunk-level values (via 8.5) across multiple real test calls on varied network conditions before being treated as final.
-
----
-
-## 9. Suggested next steps, in order
+## 7. Suggested next steps, in order
 
 1. **Get the Android build working** — resolve the AGP/Gradle/Flutter version compatibility issue once and for all (see Known Issue #3).
-2. ~~Verify the TFLite model's correctness against PyTorch~~ — **done**, see Known Issue #1 (resolved) and the MSE subsection in Section 2.
-3. **Verify the native gammatone approximation** against the Python reference implementation on the same audio (Known Issue #2) — still open.
-4. **Widen the real/fake validation set.** So far only ~3 real files and ~3 fake files have been tested (70 real chunks, 32 fake chunks). The 32.0 threshold is reasonable but should be re-checked against more speakers and, ideally, multiple different fake-voice generation sources before treating it as final.
-5. **Simulate the rolling-window rule against real chunk sequences**, not just raw MSE — confirm that a sustained real call never accidentally accumulates >20% "above threshold" chunks in any 10-chunk window (some individual real chunks do exceed 32.0, so this needs checking in sequence, not just in aggregate).
-6. Only after 3–5 are done: test the full pipeline end-to-end on two real devices in an actual LiveKit call.
+2. **Verify the TFLite model's correctness** against the original PyTorch model on real audio (Known Issue #1) — this blocks trusting any detection result.
+3. **Verify the native gammatone approximation** against the Python reference implementation on the same audio (Known Issue #2).
+4. Only after 2 and 3 are confirmed correct: test the full pipeline end-to-end on two real devices in an actual LiveKit call, and tune the rolling-window threshold (currently 10 chunks / 20%) based on real results.

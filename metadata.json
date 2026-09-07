@@ -1,0 +1,10 @@
+{
+  "name": "Swaraksha",
+  "description": "On-device AI voice deepfake and spoof detection VoIP calling application with real-time audio analysis and presence.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
